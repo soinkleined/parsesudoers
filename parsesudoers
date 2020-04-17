@@ -1,0 +1,350 @@
+#!/usr/bin/env perl
+
+#################################################################################
+#
+# Author:  David Klein
+#
+# Contact: david@soinkleined.com
+#
+# Version: 0.9 - 2016-10-13 - David Klein <david@soinkleined.com>
+#          * added support for include and includedir, usually used for sudoers.local or sudoers.d
+#          0.8 - 2015-07-28 - David Klein <david@soinkleined.com>
+#          * fixed $printLine regex the didn't match and add a delimiter for unexpanded netgroups
+#          * fixed alias parsing regex that missed rules with =
+#          0.7 - 2015-07-24 - David Klein <david@soinkleined.com>
+#          * fixed $queryLine bug that prevented printing rules more than once for multiple mathces
+#          * fixed 'all' argument
+#          0.6 - 2015-07-17 - David Klein <david@soinkleined.com>
+#          * changed expandNetgroup to allow for user, host and domain queries
+#          * added script name and version to debug output
+#          * added missing args to help
+#          0.5 - 2015-07-17 - David Klein <david@soinkleined.com>
+#          * merged two copies that had been changed independently
+#          * fixed regex for netgroup matching
+#          0.4 - 2015-07-15 - David Klein <david@soinkleined.com>
+#          * added netgroup expansion and mapping for users
+#          0.3 - 2015-07-09 - David Klein <david@soinkleined.com>
+#          * fixed regex in line matching section
+#          * fixed Total Matches debug output
+#          0.2 - 2015-07-01 - David Klein <david@soinkleined.com>
+#          * replaced id and getent commands with native perl
+#          0.1 - 2015-06-18 - David Klein <david@soinkleined.com>
+#          * Initial release
+#
+# To Do:   * expand and map Defaults
+#          * test on multiple platforms
+#          * calculate negated users and groups
+#
+# Caveats: * no planned support for AD or LDAP
+#          * using older regex syntax as environment has older versions of perl
+#
+#################################################################################
+
+use strict;
+use Getopt::Long qw(:config no_ignore_case bundling);
+use File::Basename;
+use Net::Domain qw(hostfqdn);
+use Benchmark;
+use Data::Dumper;
+
+my $username = $ENV{LOGNAME} || $ENV{USER} || getpwuid($<);
+my $cmd=basename($0);
+my $version='0.9';
+my $all;
+my $debug=0;
+my @targetUsers=();
+my @validTargetUsers=();
+my $sudoers='';
+my $Defaultsudoers='/etc/sudoers';
+my $DefaultSudoersDir='/etc/sudoers.d';
+my @Sudoers=();
+my @unknownTargetUsers=();
+my $matchedRules=0;
+my $getentPasswd='';
+my $expandGroups=0;
+my $humanReadable=0;
+my %groupMembers;
+my $hostname=hostfqdn();
+my $fqdn;
+my $prefixUser;
+my $prefixText;
+my $timeBegin=new Benchmark;
+
+GetOptions ('a|all!' => \$all,
+			'd|debug!' => \$debug,
+                        'f|file=s' => \$sudoers,
+                        'F|fqdn!' => \$fqdn,
+                        'e|expand-groups!' => \$expandGroups,
+                        'H|human-readable!' => \$humanReadable,
+                        'h|help' => \&help,
+                        'P|prefix-text=s' => \$prefixText,
+                        'p|prefix-user!' => \$prefixUser,
+                        'u|user=s' => \@targetUsers,
+                        'V|version' => \&version
+);
+
+unless (-f $sudoers){
+    $sudoers="/etc/sudoers";
+}
+push (@Sudoers, "$sudoers");
+
+
+&prterr("$cmd can only be runt as root!", "1") unless ($username eq "root");
+&prterr("No user argument given!  Please use -h for help.", "2") unless (@targetUsers || $all);
+@targetUsers=split(/,/,join(',',@targetUsers));
+
+chomp(my $sudoersCheck=`/usr/sbin/visudo -c -f $sudoers 2>&1`);
+$sudoersCheck=~s/\n/\n\+               /g;
+
+
+# Validate user args
+for (@targetUsers){
+    my ($name, $passwd, $uid, $gid, $quota, $comment, $gcos, $dir, $shell) = getpwnam($_);
+    if ($name){
+	push (@validTargetUsers, "$_");
+    } else{
+	push (@unknownTargetUsers, "$_");
+    }
+}
+
+if ($all){
+    undef @targetUsers;
+    push (@targetUsers, 'all');
+}
+
+
+my @sudoersLines;
+my @User_Alias; 
+my @Runas_Alias; 
+my @Host_Alias; 
+my @Cmnd_Alias; 
+my @Defaults; 
+
+# man 5 sudoers
+# handles 'include' and includedir directives
+open (SUDOERS, "< $sudoers") or die $!;
+while (<SUDOERS>){
+    #in case spaces after dirname	
+    if (/^#includedir\s+(\S*)\s?/){
+	opendir(DIR, "$1") or die $!;
+	foreach my $file (grep(!/(.*\..*|~)$/,readdir(DIR))){
+		push (@Sudoers, "$1/$file");
+	}
+	close DIR;
+    }
+    #in case spaces after filename	
+    if (/^#include\s+(\S*)\s?/){
+	push (@Sudoers, "$1");
+    }
+}
+close SUDOERS;
+
+foreach my $file (@Sudoers){
+    open (SUDOERS, "< $file") or die $!;
+    my $line;
+    my $multiLine;
+    while (<SUDOERS>){
+    	next if m/^$/; # Ignore empty lines
+    	next if m/^#/; # Ignore comment lines
+    	if (/^(.*)\\\n$/){
+    		if ($multiLine){
+			$multiLine.="$1";	
+		} else{
+			$multiLine="$1";
+		}
+    	} elsif ($multiLine){
+		$multiLine.="$_";	
+		$line=$multiLine;
+    		$multiLine='';
+    	} else{
+		$line="$_";
+    	}
+    	next if $multiLine;
+    	# file cleanup pre-processing for more straight-forward pattern matching
+    	$line =~ s/\s+/ /g; # Remove unneccessary space
+    	$line =~ s/\s?=\s?/=/g; # Remove space on either side of =
+    	$line =~ s/\s?:\s?/:/g; # Remove space on either side of :
+    	if ($line =~ /^User_Alias\s+(.*=.*)$/){
+		push (@User_Alias, $1);
+    	}
+    	elsif ($line =~ /^Runas_Alias\s+(.*=.*)\s?$/){
+		push (@Runas_Alias, $1);
+    	}
+    	elsif ($line =~ /^Host_Alias\s+(.*=.*)$/){
+		push (@Host_Alias, $1);
+    	}
+    	elsif ($line =~ /^Cmnd_Alias\s+(.*=.*)$/){
+		push (@Cmnd_Alias, $1);
+    	}
+    	elsif ($line =~ /^Defaults/){
+		push (@Defaults, $line);
+    	}
+    	else{
+		push (@sudoersLines, "$line");
+    	}
+    	$line='';
+	}
+}
+
+my $totalSudoersLines=@sudoersLines;
+
+sub expandGroupMembers{
+    my $groupQuery=shift;
+    unless (%groupMembers){
+	while (my($name,$pass,$uid,$gid,$quota,$comment,$gcos,$dir,$shell,$expire)=getpwent()) {
+ 		my $primaryGroup=getgrgid($gid);
+        	$groupMembers{$primaryGroup}->{$name}=1;
+    	}
+	while (my($gname,$gpasswd,$gid,$members)=getgrent()) {
+		foreach my $member (split / /, $members){
+        		$groupMembers{$gname}->{$member}=1;
+		}
+    	}
+    }
+    my $membersConcat=join(",",sort keys %{$groupMembers{$groupQuery}});
+    return "$membersConcat" || "%$groupQuery";
+}
+
+sub expandNetgroup{
+    #(host,user,domain)
+    my $netgroupQuery=shift;
+    my $netgroupQueryType=shift;
+    my @returnNetgroup;
+    my $netgroup=`/usr/bin/env ypmatch $netgroupQuery netgroup`;
+    $? != 0 and return;     #Don't continue for duff netgroups
+    my $value;
+    my $recurse;
+    $netgroup =~ s/\s+/ /g;       #Compress whitespace
+    $netgroup =~ s/\s+,/,/g;      #Remove space before a comma
+    $netgroup =~ s/,\s+/,/g;      #Remove space after a comma
+
+    foreach $value (split /\s+/,$netgroup){
+            # A member will either be a  tuple in brackets or another
+            # netgroup.
+            if($value =~ /^[^(]/){
+                    if ($recurse){
+                            push (@returnNetgroup,expandNetgroup($value));
+                    } else{
+                            push (@returnNetgroup,$value);
+                    }
+            } elsif ($value =~ /(\w+),/ && ($netgroupQueryType eq "host")){
+                    push (@returnNetgroup,$1);
+            } elsif ($value =~ /,(\w+),/ && ($netgroupQueryType eq "user")){
+                    push (@returnNetgroup,$1);
+            } elsif ($value =~ /,(\w+ && ($netgroupQueryType eq "domain"))/){
+                    push (@returnNetgroup,$1);
+            }
+    }
+    my $netgroupMembers=join(",", @returnNetgroup);
+    return $netgroupMembers;
+}
+
+
+
+for (@User_Alias,@Runas_Alias,@Host_Alias,@Cmnd_Alias){
+    /^([\w|\-]*)=\s?(.*)\s?$/;
+    my $Alias=$1;
+    my $Definition=$2;
+   s/\b$Alias\b/$Definition/g for @sudoersLines;
+   # text cleanup post-processing as alias expansion required first, perhaps apply to definition above
+   s/\s+,/,/g for @sudoersLines;# Removes space before ,
+   s/\s?\)\s?/\)/g for @sudoersLines; # Remove space surrounding )
+}
+
+for my $targetUser (@targetUsers){
+    my $matchIndex;
+    $prefixUser=$targetUser if $prefixUser;
+    for my $queryLine (@sudoersLines){
+    	if (($all &&  ($queryLine =~ /^([%|+]?)(([\w|-]+,?)+)\s+[\w|-]+\s?=.*$/)) || ($queryLine =~ /^([%|+]?)(([\w|-]+,?)+)\s+[\w|-]+\s?=\(.*\b$targetUser\b.*\).*:?.*$/) || ((($queryLine =~ /^([%|+]?)(([\w|-]+,?)+)\s+[\w|-]+\s?=[^(].*:?.*$/) || ($queryLine =~ /^([%|+]?)(([\w|-]+,?)+)\s+[\w|-]+\s?=\(.*\bALL\b.*\).*:?.*$/)) && ($targetUser eq "root"))){
+		my $printLine=$queryLine;# needed so regex looks at original line and not modified line
+		my $lookupType=$1;
+		my $group2ex=$2;
+                my $allMembers;
+		if ($lookupType =~ /^([%|+])/ && $expandGroups && !$humanReadable){
+			$allMembers=&expandGroupMembers($group2ex) if ($1 eq '%');
+			$allMembers=&expandNetgroup($group2ex,'user') if ($1 eq '+');
+			$lookupType="\\$lookupType" if ($1 eq '+');
+			$printLine =~ s/^$lookupType$group2ex/$allMembers/g;
+		}
+		$printLine =~ s/^(([%|+]?[\w|\-|,]?)+)\s+/$1:/g;
+		$printLine =~ s/,\s+/\n\t/g if $humanReadable;
+		$printLine = "$prefixUser:$printLine" if $prefixUser;
+                $printLine = "$hostname:$printLine" if $fqdn;
+                $printLine = "$prefixText:$printLine" if $prefixText;
+		print "$printLine\n";
+		$matchedRules++;
+	} 
+    
+    }
+}
+ 
+close SUDOERS;
+my $timeEnd=new Benchmark;
+my $runtime=timestr(timediff($timeEnd, $timeBegin));
+
+#######################################
+# Functions
+#######################################
+
+sub help{
+    print <<EOF;
+
+Usage: $cmd -u user
+       $cmd -u user1,user2
+       $cmd -u user1 -u user2
+       $cmd -u user -f file
+       $cmd -u user [-deFPp]
+       $cmd -a
+       $cmd -h
+       $cmd -V
+
+Parses sudoers file and expands alias and groups for given users to determine who and what can run commands as that user.
+
+Arguments:
+ -a, --all              match all sudoers rules
+ -d, --debug            print debugging information
+ -e, --expand-group     expand group names into member lists
+ -f, --file             path to sudoers file
+ -F, --fqdn             prefix fully qualified hostname
+ -H, --human-readable   will not expand groups and prints commands on several lines
+ -h, --help             print this help and exit
+ -P, --prefix-text      prefix arbitrary text
+ -p, --prefix-user      prefix query user
+ -u, --user             user(s) to query
+ -V, --version          output version information and exit
+
+Report bugs to <david\@soinkleined.com>
+
+EOF
+exit 0;
+}
+sub version{
+    print <<EOF;
+$version
+EOF
+    exit 0;
+}
+
+
+if ($debug){
+    print <<EOF;
++------------------------------------------------------------------------
++ DEBUG - $cmd v. $version
++------------------------------------------------------------------------
++ Sudoers File: $sudoers
++ Valid Query User(s): @validTargetUsers
++ Unknown Query User(s): @unknownTargetUsers
++ Total Sudo Rules: $totalSudoersLines
++ Total Matched Rules: $matchedRules
++ Total Runtime: $runtime
++ Visudo Check: $sudoersCheck
++------------------------------------------------------------------------
+EOF
+}
+
+sub prterr{
+    my $Message=shift;
+    my $ExitCode=shift;
+    print "$Message\n";
+    exit $ExitCode;
+}

@@ -8,7 +8,7 @@
            parsesudoers -h
            parsesudoers -V
     
-    Parses sudoers file and expands alias and groups for given users to determine who and what can run commands as that user.
+    Parses sudoers file and expands aliases and groups for given users to determine who and what can run commands as that user.
     
     Arguments:
      -a, --all              match all sudoers rules
